@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cat's Cradle — Laser Hand Tracking</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #000;
+      overflow: hidden;
+      font-family: monospace;
+    }
+
+    #container {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    video {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+      opacity: 0;
+    }
+
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    #ui {
+      position: absolute;
+      top: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      z-index: 10;
+    }
+
+    #status {
+      color: #0ff;
+      font-size: 12px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      text-shadow: 0 0 8px #0ff;
+      padding: 6px 14px;
+      border: 1px solid rgba(0, 255, 255, 0.3);
+      border-radius: 4px;
+      background: rgba(0, 0, 0, 0.6);
+    }
+
+    #start-btn {
+      background: transparent;
+      border: 1px solid rgba(0, 255, 255, 0.5);
+      color: #0ff;
+      font-family: monospace;
+      font-size: 12px;
+      letter-spacing: 2px;
+      padding: 6px 16px;
+      cursor: pointer;
+      border-radius: 4px;
+      text-shadow: 0 0 8px #0ff;
+      transition: all 0.2s;
+    }
+
+    #start-btn:hover {
+      background: rgba(0, 255, 255, 0.1);
+      border-color: #0ff;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="container">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="canvas"></canvas>
+    <div id="ui">
+      <div id="status">Press Enable Camera</div>
+      <button id="start-btn" onclick="startCamera()">Enable Camera</button>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1640029074/camera_utils.js"
+    crossorigin="anonymous"></script>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const startBtn = document.getElementById('start-btn');
+
+    let W, H;
+    let handsData = [];
+    let particles = [];
+    let lastTouchState = {};
+    let mpCamera = null;
+
+    function resize() {
+      W = canvas.width = window.innerWidth;
+      H = canvas.height = window.innerHeight;
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    const FINGERTIP_IDS = [4, 8, 12, 16, 20];
+    const JOINT_IDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+
+    function lm(hand, idx) {
+      const l = hand.landmarks[idx];
+      return { x: (1 - l.x) * W, y: l.y * H };
+    }
+
+    class Particle {
+      constructor(x, y, color) {
+        this.x = x; this.y = y;
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 1 + Math.random() * 5;
+        this.vx = Math.cos(angle) * speed;
+        this.vy = Math.sin(angle) * speed;
+        this.life = 1;
+        this.decay = 0.02 + Math.random() * 0.04;
+        this.size = 2 + Math.random() * 4;
+        this.color = color;
+      }
+      update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        this.vx *= 0.95;
+        this.vy *= 0.95;
+        this.life -= this.decay;
+      }
+      draw(ctx) {
+        if (this.life <= 0) return;
+        ctx.save();
+        ctx.globalAlpha = this.life;
+        ctx.shadowBlur = 12;
+        ctx.shadowColor = this.color;
+        ctx.fillStyle = this.color;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.size * this.life, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    function explode(x, y, color, count = 40) {
+      for (let i = 0; i < count; i++) particles.push(new Particle(x, y, color));
+    }
+
+    function dist(a, b) {
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    }
+
+    function getGradientColor(d, maxD) {
+      const t = Math.min(d / maxD, 1);
+      const r0 = 0, g0 = 255, b0 = 255;
+      const r1 = 255, g1 = 0, b1 = 255;
+      const r2 = 255, g2 = 255, b2 = 0;
+      let r, g, b;
+      if (t < 0.5) {
+        const s = t * 2;
+        r = r0 + (r1 - r0) * s;
+        g = g0 + (g1 - g0) * s;
+        b = b0 + (b1 - b0) * s;
+      } else {
+        const s = (t - 0.5) * 2;
+        r = r1 + (r2 - r1) * s;
+        g = g1 + (g2 - g1) * s;
+        b = b1 + (b2 - b1) * s;
+      }
+      return `rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`;
+    }
+
+    function drawLaserBeam(ctx, x1, y1, x2, y2, color, thickness) {
+      const grad = ctx.createLinearGradient(x1, y1, x2, y2);
+      grad.addColorStop(0, color);
+      grad.addColorStop(0.5, '#ffffff');
+      grad.addColorStop(1, color);
+
+      ctx.save();
+
+      // Outer glow
+      ctx.shadowBlur = 20;
+      ctx.shadowColor = color;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = thickness * 2.5;
+      ctx.globalAlpha = 0.25;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+
+      // Core beam
+      ctx.shadowBlur = 14;
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = thickness;
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+
+      // Bright center line
+      ctx.shadowBlur = 4;
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = Math.max(0.5, thickness * 0.35);
+      ctx.globalAlpha = 0.7;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    function drawJointDot(ctx, x, y, color, size) {
+      ctx.save();
+      ctx.shadowBlur = 18;
+      ctx.shadowColor = color;
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.arc(x, y, size, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 6;
+      ctx.fillStyle = '#ffffff';
+      ctx.globalAlpha = 0.8;
+      ctx.beginPath();
+      ctx.arc(x, y, size * 0.4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function onResults(results) {
+      handsData = [];
+      if (!results.multiHandLandmarks) return;
+      for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+        const label = results.multiHandedness[i].label;
+        const mirrored = label === 'Left' ? 'Right' : 'Left';
+        handsData.push({ label: mirrored, landmarks: results.multiHandLandmarks[i] });
+      }
+    }
+
+    function frame() {
+      requestAnimationFrame(frame);
+      ctx.clearRect(0, 0, W, H);
+
+      if (video.readyState >= 2 && video.srcObject) {
+        ctx.save();
+        ctx.translate(W, 0);
+        ctx.scale(-1, 1);
+        ctx.drawImage(video, 0, 0, W, H);
+        ctx.restore();
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.65)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.restore();
+      } else {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, W, H);
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,255,255,0.04)';
+        for (let y = 0; y < H; y += 24) ctx.fillRect(0, y, W, 1);
+        ctx.restore();
+      }
+
+      particles = particles.filter(p => p.life > 0);
+      particles.forEach(p => { p.update(); p.draw(ctx); });
+
+      let leftHand = handsData.find(h => h.label === 'Right');
+      let rightHand = handsData.find(h => h.label === 'Left');
+
+      if (leftHand && rightHand) {
+        for (let fi = 0; fi < FINGERTIP_IDS.length; fi++) {
+          const lTip = lm(leftHand, FINGERTIP_IDS[fi]);
+          const rTip = lm(rightHand, FINGERTIP_IDS[fi]);
+          const d = dist(lTip, rTip);
+          const maxD = Math.hypot(W, H) * 0.6;
+          const color = getGradientColor(d, maxD);
+          const thickness = Math.max(1, 4 - (d / maxD) * 3);
+
+          drawLaserBeam(ctx, lTip.x, lTip.y, rTip.x, rTip.y, color, thickness);
+
+          const key = `finger_${fi}`;
+          const touching = d < 30;
+          if (touching && !lastTouchState[key]) {
+            const mx = (lTip.x + rTip.x) / 2;
+            const my = (lTip.y + rTip.y) / 2;
+            ['#00ffff', '#ff00ff', '#ffff00'].forEach(c => explode(mx, my, c, 20));
+            lastTouchState[key] = true;
+          } else if (!touching) {
+            lastTouchState[key] = false;
+          }
+        }
+      }
+
+      handsData.forEach((hand, hi) => {
+        const baseColor = hi === 0 ? '#00ffff' : '#ff00ff';
+        JOINT_IDS.forEach((id, ii) => {
+          const p = lm(hand, id);
+          const isTip = FINGERTIP_IDS.includes(id);
+          const ci = Math.floor((ii / JOINT_IDS.length) * 3);
+          const tipColors = ['#00ffff', '#ff00ff', '#ffff00'];
+          const dotColor = isTip ? tipColors[ci % 3] : baseColor;
+          drawJointDot(ctx, p.x, p.y, dotColor, isTip ? 7 : 3.5);
+        });
+      });
+
+      if (handsData.length === 0 && video.srcObject) {
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,255,255,0.25)';
+        ctx.font = '13px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('RAISE YOUR HANDS', W / 2, H / 2);
+        ctx.restore();
+      }
+    }
+
+    async function startCamera() {
+      startBtn.style.display = 'none';
+      statusEl.textContent = 'Requesting camera...';
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 1280, height: 720, facingMode: 'user' }
+        });
+        video.srcObject = stream;
+
+        const hands = new Hands({
+          locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${f}`
+        });
+        hands.setOptions({
+          maxNumHands: 2,
+          modelComplexity: 1,
+          minDetectionConfidence: 0.7,
+          minTrackingConfidence: 0.5
+        });
+        hands.onResults(onResults);
+
+        mpCamera = new Camera(video, {
+          onFrame: async () => { await hands.send({ image: video }); },
+          width: 1280, height: 720
+        });
+        await mpCamera.start();
+        statusEl.textContent = "Cat's Cradle Active";
+      } catch (e) {
+        statusEl.textContent = 'Camera denied';
+        startBtn.style.display = 'block';
+        startBtn.textContent = 'Retry';
+        console.error(e);
+      }
+    }
+
+    frame();
+  </script>
+</body>
+
+</html>
